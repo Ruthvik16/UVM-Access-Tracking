@@ -1,0 +1,11 @@
+ATAX - Regular
+BICG - Regular
+CORR - Regular
+COVAR - Regular with a stride of M = 2048. Adjacent threads access adjacent addresses.
+FDTD-2D - Regular
+GEMM - Regular, something like matrix multiplication
+GESUMMV - regular, probably without a stride
+GRAMSCHM - Some matrix orthogonalization. Regular
+MVT - Regular with a stride of N = 4096. Adjacent threads access adjacent addresses.
+SYR2K - Regular
+SYRK - Regular

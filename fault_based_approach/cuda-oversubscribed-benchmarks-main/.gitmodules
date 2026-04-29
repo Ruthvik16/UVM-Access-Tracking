@@ -1,0 +1,4 @@
+[submodule "vllm"]
+	path = vllm
+	url = git@git.cse.iitk.ac.in:prospar/vllm.git
+	branch = uvm_0.16.0rc1

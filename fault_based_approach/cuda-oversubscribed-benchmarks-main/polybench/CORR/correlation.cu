@@ -1,0 +1,372 @@
+/**
+ * correlation.cu: This file is part of the PolyBench/GPU 1.0 test suite.
+ *
+ *
+ * Contact: Scott Grauer-Gray <sgrauerg@gmail.com>
+ * Louis-Noel Pouchet <pouchet@cse.ohio-state.edu>
+ * Web address: http://www.cse.ohio-state.edu/~pouchet/software/polybench/GPU
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <assert.h>
+#include <sys/time.h>
+#include <cuda.h>
+
+#if __has_include("../../../common/polybenchUtilFuncts.h")
+// Because we've copied from UVMBench
+#include "../../../common/polybenchUtilFuncts.h"
+#endif
+
+#if __has_include("../polybenchUtilFuncts.h")
+#include "../polybenchUtilFuncts.h"
+#endif
+
+//define the error threshold for the results "not matching"
+#define PERCENT_DIFF_ERROR_THRESHOLD 1.05
+
+#define GPU_DEVICE 0
+
+/* Problem size */
+#define M 2048
+#define N 2048
+
+// Make it parametrizable
+#undef M
+#undef N
+long M;
+long N;
+
+/* Thread block dimensions for kernel 1*/
+#define DIM_THREAD_BLOCK_KERNEL_1_X 256
+#define DIM_THREAD_BLOCK_KERNEL_1_Y 1
+
+/* Thread block dimensions for kernel 2*/
+#define DIM_THREAD_BLOCK_KERNEL_2_X 256
+#define DIM_THREAD_BLOCK_KERNEL_2_Y 1
+
+/* Thread block dimensions for kernel 3*/
+#define DIM_THREAD_BLOCK_KERNEL_3_X 32
+#define DIM_THREAD_BLOCK_KERNEL_3_Y 8
+
+/* Thread block dimensions for kernel 4*/
+#define DIM_THREAD_BLOCK_KERNEL_4_X 256
+#define DIM_THREAD_BLOCK_KERNEL_4_Y 1
+
+#define sqrt_of_array_cell(x,j) sqrt(x[j])
+
+#define FLOAT_N 3214212.01f
+#define EPS 0.005f
+
+/* Can switch DATA_TYPE between float and double */
+typedef float DATA_TYPE;
+
+
+void init_arrays(DATA_TYPE* data, DATA_TYPE* data_gpu)
+{
+	int i, j;
+	
+	for (i=0; i < (M+1); i++) 
+	{
+    		for (j=0; j< (N+1); j++) 
+		{
+			if (compare_with_cpu)
+				data[i*(N+1) + j] = ((DATA_TYPE) i*j)/ (M+1);	
+				data_gpu[i*(N+1) + j] = ((DATA_TYPE) i*j)/ (M+1);	
+       		}
+    	}
+}
+
+
+void correlation(DATA_TYPE* data, DATA_TYPE* mean, DATA_TYPE* stddev, DATA_TYPE* symmat)
+{
+	int i, j, j1, j2;	
+	
+	// Determine mean of column vectors of input data matrix 
+  	for (j = 1; j < (M+1); j++)
+   	{
+  		mean[j] = 0.0;
+
+   		for (i = 1; i < (N+1); i++)
+		{
+			mean[j] += data[i*(M+1) + j];
+   		}
+		
+		mean[j] /= (DATA_TYPE)FLOAT_N;
+   	}
+
+	// Determine standard deviations of column vectors of data matrix. 
+  	for (j = 1; j < (M+1); j++)
+   	{
+   		stddev[j] = 0.0;
+      
+		for (i = 1; i < (N+1); i++)
+		{
+			stddev[j] += (data[i*(M+1) + j] - mean[j]) * (data[i*(M+1) + j] - mean[j]);
+		}
+		
+		stddev[j] /= FLOAT_N;
+		stddev[j] = sqrt_of_array_cell(stddev, j);
+		stddev[j] = stddev[j] <= EPS ? 1.0 : stddev[j];
+	}
+
+ 	// Center and reduce the column vectors. 
+  	for (i = 1; i < (N+1); i++)
+	{
+		for (j = 1; j < (M+1); j++)
+		{
+			data[i*(M+1) + j] -= mean[j];
+			data[i*(M+1) + j] /= (sqrt(FLOAT_N)*stddev[j]) ;
+		}
+	}
+
+	// Calculate the m * m correlation matrix. 
+  	for (j1 = 1; j1 < M; j1++)
+	{	
+		symmat[j1*(M+1) + j1] = 1.0;
+    
+		for (j2 = j1+1; j2 < (M+1); j2++)
+		{
+	  		symmat[j1*(M+1) + j2] = 0.0;
+
+	  		for (i = 1; i < (N+1); i++)
+			{
+	   			symmat[j1*(M+1) + j2] += (data[i*(M+1) + j1] * data[i*(M+1) + j2]);
+			}
+
+	  		symmat[j2*(M+1) + j1] = symmat[j1*(M+1) + j2];
+		}
+	}
+ 
+	symmat[M*(M+1) + M] = 1.0;
+}
+
+
+void compareResults(DATA_TYPE* symmat, DATA_TYPE* symmat_outputFromGpu)
+{
+	int i,j,fail;
+	fail = 0;
+
+	for (i=1; i < (M+1); i++)
+	{
+		for (j=1; j < (N+1); j++)
+		{
+			if (percentDiff(symmat[i*(N+1) + j], symmat_outputFromGpu[i*(N+1) + j]) > PERCENT_DIFF_ERROR_THRESHOLD)
+			{
+				fail++;
+				printf("i: %d j: %d\n1: %f 2: %f\n", i, j, symmat[i*N + j], symmat_outputFromGpu[i*N + j]);
+		
+			}
+		}
+	}
+	
+	// print results
+	printf("Non-Matching CPU-GPU Outputs Beyond Error Threshold of %4.2f Percent: %d\n", PERCENT_DIFF_ERROR_THRESHOLD, fail);
+}
+
+
+void GPU_argv_init()
+{
+	cudaDeviceProp deviceProp;
+	cudaGetDeviceProperties(&deviceProp, GPU_DEVICE);
+	printf("setting device %d with name %s\n",GPU_DEVICE,deviceProp.name);
+	cudaSetDevice( GPU_DEVICE );
+}
+
+	
+__global__ void mean_kernel(DATA_TYPE *mean, DATA_TYPE *data, long M, long N)
+{
+	int j = blockIdx.x * blockDim.x + threadIdx.x + 1;
+
+	if ((j >= 1) && (j < (M+1)))
+	{
+		mean[j] = 0.0;
+
+		int i;
+		for(i=1; i < (N+1); i++)
+		{
+			mean[j] += data[i*(M+1) + j];
+		}
+		
+		mean[j] /= (DATA_TYPE)FLOAT_N;
+	}
+}
+
+
+__global__ void std_kernel(DATA_TYPE *mean, DATA_TYPE *std, DATA_TYPE *data, long M, long N)
+{
+	int j = blockIdx.x * blockDim.x + threadIdx.x + 1;
+	
+	if ((j >= 1) && (j < (M+1)))
+	{
+		std[j] = 0.0;
+
+		int i;
+		for(i = 1; i < (N+1); i++)
+		{
+			std[j] += (data[i*(M+1) + j] - mean[j]) * (data[i*(M+1) + j] - mean[j]);
+		}
+		std[j] /= (FLOAT_N);
+		std[j] = sqrt(std[j]);
+		if(std[j] <= EPS) 
+		{
+			std[j] = 1.0;
+		}
+	}
+}
+
+
+__global__ void reduce_kernel(DATA_TYPE *mean, DATA_TYPE *std, DATA_TYPE *data, long M, long N)
+{
+	int j = blockIdx.x * blockDim.x + threadIdx.x + 1;
+	int i = blockIdx.y * blockDim.y + threadIdx.y + 1;
+	
+	if ((i >= 1) && (i < (N+1)) && (j >= 1) && (j < (M+1)))
+	{
+		data[i*(M+1) + j] -= mean[j];
+		data[i*(M+1) + j] /= (sqrt(FLOAT_N) * std[j]);
+	}
+}
+
+
+__global__ void corr_kernel(DATA_TYPE *symmat, DATA_TYPE *data, long M, long N)
+{
+	int j1 = blockIdx.x * blockDim.x + threadIdx.x + 1;
+
+	int i, j2;
+	if ((j1 >= 1) && (j1 < M))
+	{
+		symmat[j1*(M+1) + j1] = 1.0;
+
+		for (j2 = (j1 + 1); j2 < (M+1); j2++)
+		{
+			symmat[j1*(M+1) + j2] = 0.0;
+
+			for(i = 1; i < (N+1); i++)
+			{
+				symmat[j1*(M+1) + j2] += data[i*(M+1) + j1] * data[i*(M+1) + j2];
+			}
+			symmat[j2*(M+1) + j1] = symmat[j1*(M+1) + j2];
+		}
+	}
+}
+
+
+void correlationCuda(DATA_TYPE* data_gpu, DATA_TYPE* mean_gpu, DATA_TYPE* stddev_gpu, DATA_TYPE* symmat_gpu)
+{
+	double t_start, t_end;
+
+		
+	dim3 block1(DIM_THREAD_BLOCK_KERNEL_1_X, DIM_THREAD_BLOCK_KERNEL_1_Y);
+	dim3 grid1((size_t)(ceil((float)(M)) / ((float)DIM_THREAD_BLOCK_KERNEL_1_X)), 1);
+	
+	dim3 block2(DIM_THREAD_BLOCK_KERNEL_2_X, DIM_THREAD_BLOCK_KERNEL_2_Y);
+	dim3 grid2((size_t)(ceil((float)(M)) / ((float)DIM_THREAD_BLOCK_KERNEL_2_X)), 1);
+	
+	dim3 block3(DIM_THREAD_BLOCK_KERNEL_3_X, DIM_THREAD_BLOCK_KERNEL_3_Y);
+	dim3 grid3((size_t)(ceil((float)(M)) / ((float)DIM_THREAD_BLOCK_KERNEL_3_X)), (size_t)(ceil((float)(N)) / ((float)DIM_THREAD_BLOCK_KERNEL_3_Y)));
+	
+	dim3 block4(DIM_THREAD_BLOCK_KERNEL_4_X, DIM_THREAD_BLOCK_KERNEL_4_Y);
+	dim3 grid4((size_t)(ceil((float)(M)) / ((float)DIM_THREAD_BLOCK_KERNEL_4_X)), 1);
+
+	t_start = rtclock();
+	mean_kernel<<< grid1, block1 >>>(mean_gpu,data_gpu, M, N);
+	cudaDeviceSynchronize();
+	std_kernel<<< grid2, block2 >>>(mean_gpu,stddev_gpu,data_gpu, M, N);
+	cudaDeviceSynchronize();
+	reduce_kernel<<< grid3, block3 >>>(mean_gpu,stddev_gpu,data_gpu, M, N);
+	cudaDeviceSynchronize();
+	corr_kernel<<< grid4, block4 >>>(symmat_gpu,data_gpu, M, N);
+	cudaDeviceSynchronize();
+	t_end = rtclock();
+	fprintf(stdout, "GPU Runtime: %0.6lfs\n", t_end - t_start);	
+
+	// the one-line output at the end
+	fprintf(stdout, __FILE__ " GPU: %lf s ; ", t_end - t_start);
+	// In main(), print CPU+GPU right after this
+	symmat_gpu[(M)*(M+1) + (M)] = 1.0;
+	// DATA_TYPE valueAtSymmatIndexMTimesMPlus1PlusMPoint = 1.0;
+	// cudaMemcpy(&(symmat_gpu[(M)*(M+1) + (M)]), &valueAtSymmatIndexMTimesMPlus1PlusMPoint, sizeof(DATA_TYPE), cudaMemcpyHostToDevice);
+}
+
+
+int main(int argc, char *argv[])
+{
+	double t_start, t_end;
+	double t_after_array_init;
+
+	long target_size = 1 << 25;
+	if (argc > 1 && argv[1][0] != '-')
+		target_size = atol(argv[1]);
+
+	compare_with_cpu = COMPARE_WITH_CPU_DEFAULT;
+	copy_back_gpu_results = COPY_BACK_CPU_DEFAULT;
+
+	for (int i = 0; i < argc; i++) {
+		CHECK_ARG_AND_SET_VAL(i, "-compare", compare_with_cpu, true);
+		CHECK_ARG_AND_SET_VAL(i, "-copy-back", copy_back_gpu_results, true);
+		if (strncmp(argv[i], "-h", 2) == 0)
+			return 1;
+	}
+	M = get_data_size(target_size/2, sizeof(DATA_TYPE), 2);
+	N = M;
+
+	DATA_TYPE* data;
+	DATA_TYPE* mean;
+	DATA_TYPE* stddev;
+	DATA_TYPE* symmat;
+
+	DATA_TYPE *data_gpu;
+	DATA_TYPE *stddev_gpu;
+	DATA_TYPE *mean_gpu;
+	DATA_TYPE *symmat_gpu;
+
+	data = (DATA_TYPE*)malloc((M+1)*(N+1)*sizeof(DATA_TYPE));
+	mean = (DATA_TYPE*)malloc((M+1)*sizeof(DATA_TYPE));
+	stddev = (DATA_TYPE*)malloc((M+1)*sizeof(DATA_TYPE));
+	symmat = (DATA_TYPE*)malloc((M+1)*(N+1)*sizeof(DATA_TYPE));
+
+
+	cudaMallocManaged(&data_gpu, sizeof(DATA_TYPE) * (M+1) * (N+1));
+	cudaMallocManaged(&symmat_gpu, sizeof(DATA_TYPE) * (M+1) * (N+1));
+	cudaMallocManaged(&stddev_gpu, sizeof(DATA_TYPE) * (M+1));
+	cudaMallocManaged(&mean_gpu, sizeof(DATA_TYPE) * (M+1));
+
+	t_start = rtclock();
+	init_arrays(data, data_gpu);
+	t_after_array_init = rtclock();
+	printf("Init data[]: %lf s\n", t_after_array_init - t_start);
+
+	GPU_argv_init();
+
+	correlationCuda(data_gpu, mean_gpu, stddev_gpu, symmat_gpu);
+
+	if (compare_with_cpu) {
+		t_start = rtclock();
+		correlation(data, mean, stddev, symmat);
+		t_end = rtclock();
+
+		fprintf(stdout, "CPU Runtime: %0.6lfs\n", t_end - t_start);
+
+		compareResults(symmat, symmat_gpu);
+	}
+
+	if (copy_back_gpu_results)
+		TOUCH_ARRAY(symmat_gpu, sizeof(DATA_TYPE) * (N-1) * (M-1));
+
+	t_end = rtclock();
+	printf("CPU+GPU: %lf s\n", t_end - t_after_array_init);
+	free(data);
+	free(mean);
+	free(stddev);
+	free(symmat);
+
+	cudaFree(data_gpu);
+	cudaFree(symmat_gpu);
+	cudaFree(stddev_gpu);
+	cudaFree(mean_gpu);
+
+	return 0;
+}
+

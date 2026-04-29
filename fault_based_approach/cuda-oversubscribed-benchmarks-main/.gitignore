@@ -1,0 +1,14 @@
+a.out
+*exe
+./*.out
+./workspace
+cuda_helpers/
+polybench/perf_runs
+*.out
+helpers/stop.txt
+TODO.md
+backup_perf_logs/
+*.sqlite
+*.nsys-rep
+__pycache__
+*.strace

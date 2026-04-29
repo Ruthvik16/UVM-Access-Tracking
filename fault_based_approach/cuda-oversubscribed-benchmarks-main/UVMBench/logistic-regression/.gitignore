@@ -1,0 +1,6 @@
+.vscode/
+*.h.gch
+*.o
+*exec*
+*.arff
+gpu_exec

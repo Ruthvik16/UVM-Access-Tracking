@@ -1,0 +1,4 @@
+_app*
+_cuda*
+stream/cuda-stream
+stream/a.out
