@@ -1,0 +1,1246 @@
+From 115c61af582904d719b5d132c57c22f3ee859cd3 Mon Sep 17 00:00:00 2001
+From: nikhilpothuganti <nikhilp23@iitk.ac.in>
+Date: Wed, 29 Apr 2026 17:11:21 +0530
+Subject: [PATCH] uvm access tracker
+
+---
+ nvidia-uvm/nvidia-uvm-sources.Kbuild   |   2 +
+ nvidia-uvm/uvm.c                       |   7 +-
+ nvidia-uvm/uvm_forward_decl.h          |   2 +
+ nvidia-uvm/uvm_gpu_replayable_faults.c |  22 +-
+ nvidia-uvm/uvm_sampling_procfs.c       | 505 +++++++++++++++++++++++++
+ nvidia-uvm/uvm_sampling_tracker.c      | 235 ++++++++++++
+ nvidia-uvm/uvm_sampling_tracker.h      | 122 ++++++
+ nvidia-uvm/uvm_va_block.c              |  86 ++++-
+ nvidia-uvm/uvm_va_block.h              |  10 +
+ nvidia-uvm/uvm_va_range.c              |   5 +
+ nvidia-uvm/uvm_va_range.h              |   3 +
+ nvidia-uvm/uvm_va_space.c              |   4 +
+ nvidia-uvm/uvm_va_space.h              |   3 +
+ 13 files changed, 997 insertions(+), 9 deletions(-)
+ create mode 100644 nvidia-uvm/uvm_sampling_procfs.c
+ create mode 100644 nvidia-uvm/uvm_sampling_tracker.c
+ create mode 100644 nvidia-uvm/uvm_sampling_tracker.h
+
+diff --git a/nvidia-uvm/nvidia-uvm-sources.Kbuild b/nvidia-uvm/nvidia-uvm-sources.Kbuild
+index 1f104e3..0b0ebd2 100644
+--- a/nvidia-uvm/nvidia-uvm-sources.Kbuild
++++ b/nvidia-uvm/nvidia-uvm-sources.Kbuild
+@@ -108,3 +108,5 @@ NVIDIA_UVM_SOURCES += nvidia-uvm/uvm_va_block_test.c
+ NVIDIA_UVM_SOURCES += nvidia-uvm/uvm_range_group_tree_test.c
+ NVIDIA_UVM_SOURCES += nvidia-uvm/uvm_thread_context_test.c
+ NVIDIA_UVM_SOURCES += nvidia-uvm/uvm_rb_tree_test.c
++NVIDIA_UVM_SOURCES += nvidia-uvm/uvm_sampling_tracker.c
++NVIDIA_UVM_SOURCES += nvidia-uvm/uvm_sampling_procfs.c
+diff --git a/nvidia-uvm/uvm.c b/nvidia-uvm/uvm.c
+index 73ceb70..32ed0f0 100644
+--- a/nvidia-uvm/uvm.c
++++ b/nvidia-uvm/uvm.c
+@@ -35,7 +35,7 @@
+ #include "uvm_linux_ioctl.h"
+ #include "uvm_hmm.h"
+ #include "uvm_mem.h"
+-
++#include "uvm_sampling_tracker.h"
+ #define NVIDIA_UVM_DEVICE_NAME          "nvidia-uvm"
+ 
+ static dev_t g_uvm_base_dev;
+@@ -1065,6 +1065,9 @@ static int uvm_init(void)
+     int ret;
+ 
+     NV_STATUS status = uvm_global_init();
++    
++    uvm_sampling_tracker_init();
++
+     if (status != NV_OK) {
+         UVM_ERR_PRINT("uvm_global_init() failed: %s\n", nvstatusToString(status));
+         ret = -ENODEV;
+@@ -1114,6 +1117,8 @@ static void uvm_exit(void)
+     uvm_tools_exit();
+     uvm_chardev_exit();
+ 
++    uvm_sampling_tracker_destroy();
++    
+     uvm_global_exit();
+ 
+     uvm_test_unload_state_exit();
+diff --git a/nvidia-uvm/uvm_forward_decl.h b/nvidia-uvm/uvm_forward_decl.h
+index bf8e1fb..4b650d7 100644
+--- a/nvidia-uvm/uvm_forward_decl.h
++++ b/nvidia-uvm/uvm_forward_decl.h
+@@ -57,6 +57,8 @@ typedef struct uvm_va_block_test_struct uvm_va_block_test_t;
+ typedef struct uvm_va_block_wrapper_struct uvm_va_block_wrapper_t;
+ typedef struct uvm_va_space_struct uvm_va_space_t;
+ typedef struct uvm_va_space_mm_struct uvm_va_space_mm_t;
++typedef struct uvm_va_space_tracker_struct uvm_va_space_tracker_t;
++typedef struct uvm_va_range_tracker_struct uvm_va_range_tracker_t;
+ 
+ typedef struct uvm_make_resident_context_struct uvm_make_resident_context_t;
+ 
+diff --git a/nvidia-uvm/uvm_gpu_replayable_faults.c b/nvidia-uvm/uvm_gpu_replayable_faults.c
+index 0257ee1..7fa8868 100644
+--- a/nvidia-uvm/uvm_gpu_replayable_faults.c
++++ b/nvidia-uvm/uvm_gpu_replayable_faults.c
+@@ -40,6 +40,8 @@
+ #include "uvm_ats_faults.h"
+ #include "uvm_test.h"
+ 
++#include "uvm_sampling_tracker.h"
++
+ // The documentation at the beginning of uvm_gpu_non_replayable_faults.c
+ // provides some background for understanding replayable faults, non-replayable
+ // faults, and how UVM services each fault type.
+@@ -1153,6 +1155,9 @@ static NV_STATUS service_batch_managed_faults_in_block_locked(uvm_gpu_t *gpu,
+     block_context->thrashing_pin_count = 0;
+     block_context->read_duplicate_count = 0;
+ 
++    if (va_space->sampling_tracker)
++        uvm_sampling_tracker_set_context(va_space->sampling_tracker, gpu->id.val);
++
+     uvm_range_group_range_migratability_iter_first(va_space, va_block->start, va_block->end, &iter);
+ 
+     // The first entry is guaranteed to fall within this block
+@@ -1177,6 +1182,16 @@ static NV_STATUS service_batch_managed_faults_in_block_locked(uvm_gpu_t *gpu,
+         uvm_fault_access_type_t service_access_type;
+         NvU32 service_access_type_mask;
+ 
++        if (uvm_sampling_tracker_block_sampled(va_space->sampling_tracker,
++                                               va_block->va_range->sampling_tracker,
++                                               va_block->start))
++            uvm_sampling_tracker_record(
++                    va_space->sampling_tracker,
++                    va_block->va_range->sampling_tracker,
++                    current_entry->fault_address,
++                    va_block->va_range->node.start,
++                    (u8)current_entry->fault_access_type);
++
+         UVM_ASSERT(current_entry->fault_access_type ==
+                    uvm_fault_access_type_mask_highest(current_entry->access_type_mask));
+ 
+@@ -1606,12 +1621,7 @@ static NV_STATUS service_fault_batch(uvm_gpu_t *gpu,
+         if (replay_per_va_block) {
+             status = push_replay_on_gpu(gpu, UVM_FAULT_REPLAY_TYPE_START, batch_context);
+             if (status != NV_OK)
+-                goto fail;
+-
+-            // Increment the batch id if UVM_PERF_FAULT_REPLAY_POLICY_BLOCK
+-            // is used, as we issue a replay after servicing each VA block
+-            // and we can service a number of VA blocks before returning.
+-            ++batch_context->batch_id;
++                break;
+         }
+     }
+ 
+diff --git a/nvidia-uvm/uvm_sampling_procfs.c b/nvidia-uvm/uvm_sampling_procfs.c
+new file mode 100644
+index 0000000..9a2d2ad
+--- /dev/null
++++ b/nvidia-uvm/uvm_sampling_procfs.c
+@@ -0,0 +1,505 @@
++#include <linux/proc_fs.h>
++#include <linux/uaccess.h>
++#include <linux/seq_file.h>
++#include <linux/mutex.h>
++#include <linux/workqueue.h>
++#include <linux/timekeeping.h>
++
++#include "uvm_global.h"
++#include "uvm_sampling_tracker.h"
++#include "uvm_va_space.h"
++#include "uvm_va_range.h"
++#include "uvm_va_block.h"
++#include "uvm_processors.h"
++
++#define PROC_NAME "uvm_sampling_tracker"
++
++static struct proc_dir_entry *tracker_proc;
++static DEFINE_MUTEX(tracker_lock);
++
++/* Timed tracking window — auto-stops after track_window <ms> expires. */
++static struct delayed_work g_track_stop_work;
++static atomic_t           g_track_window_active = ATOMIC_INIT(0);
++static u64                g_track_window_end_ns;
++
++/* ktime_get_ns() pulls in ktime_get() which is EXPORT_SYMBOL_GPL and cannot
++ * be called from a proprietary module.  Use ktime_get_raw_ts64 instead. */
++static inline u64 tracker_ktime_ns(void)
++{
++    struct timespec64 ts;
++    ktime_get_raw_ts64(&ts);
++    return timespec64_to_ns(&ts);
++}
++
++/* UVM fault access type names — must match UVM_FAULT_ACCESS_TYPE_* order */
++static const char * const access_type_names[] = {
++    "prefetch", "read", "write", "atomic_weak", "atomic_strong"
++};
++
++static void tracker_show_access_mask(struct seq_file *m, u32 access_mask)
++{
++    size_t i;
++    bool first = true;
++
++    if (access_mask == 0) {
++        seq_puts(m, "none");
++        return;
++    }
++
++    for (i = 0; i < ARRAY_SIZE(access_type_names); ++i) {
++        if ((access_mask & (1U << i)) == 0)
++            continue;
++
++        if (!first)
++            seq_putc(m, '|');
++
++        seq_puts(m, access_type_names[i]);
++        first = false;
++    }
++}
++
++static void tracker_clear_range(uvm_va_range_tracker_t *range_tracker)
++{
++    if (range_tracker)
++        bitmap_zero(range_tracker->bitmap, range_tracker->nr_pages);
++}
++
++/* =========================
++   TIMED WINDOW
++   ========================= */
++
++static void track_stop_fn(struct work_struct *work)
++{
++    uvm_va_space_t *va_space;
++
++    atomic_set(&g_track_window_active, 0);
++    uvm_sampling_tracker_set_default_active(0);
++
++    uvm_mutex_lock(&g_uvm_global.va_spaces.lock);
++    list_for_each_entry(va_space, &g_uvm_global.va_spaces.list, list_node) {
++        if (va_space->sampling_tracker)
++            WRITE_ONCE(va_space->sampling_tracker->active, 0);
++    }
++    uvm_mutex_unlock(&g_uvm_global.va_spaces.lock);
++
++    pr_info("[tracker] track_window expired, tracking stopped\n");
++}
++
++/* =========================
++   READ
++   ========================= */
++
++static int tracker_show(struct seq_file *m, void *v)
++{
++    uvm_va_space_t *va_space;
++    unsigned long n_bitmap = 0;
++    unsigned long n_rich = 0;
++    unsigned long tracked_spaces = 0;
++    unsigned long tracked_ranges = 0;
++
++    mutex_lock(&tracker_lock);
++    uvm_mutex_lock(&g_uvm_global.va_spaces.lock);
++
++    list_for_each_entry(va_space, &g_uvm_global.va_spaces.list, list_node) {
++        uvm_va_range_t *va_range;
++        uvm_va_space_tracker_t *space_tracker = va_space->sampling_tracker;
++
++        if (!space_tracker)
++            continue;
++
++        tracked_spaces++;
++        uvm_va_space_down_read(va_space);
++
++        uvm_for_each_va_range(va_range, va_space) {
++            uvm_va_range_tracker_t *range_tracker = va_range->sampling_tracker;
++            unsigned long page_index;
++            u32 cur_epoch;
++
++            if (!range_tracker)
++                continue;
++
++            tracked_ranges++;
++            cur_epoch = READ_ONCE(space_tracker->epoch);
++
++            for_each_set_bit(page_index, range_tracker->bitmap, range_tracker->nr_pages) {
++                uvm_page_record_t *rec;
++
++                n_bitmap++;
++                rec = &range_tracker->records[uvm_sampling_tracker_record_index(range_tracker, page_index)];
++                if (READ_ONCE(rec->epoch) == cur_epoch)
++                    n_rich++;
++            }
++        }
++
++        uvm_va_space_up_read(va_space);
++    }
++
++    seq_printf(m,
++               "active_default=%d\nsample_rate_default=%u\ntracked_va_spaces=%lu\ntracked_ranges=%lu\n",
++               uvm_sampling_tracker_default_active(),
++               uvm_sampling_tracker_default_sample_rate(),
++               tracked_spaces,
++               tracked_ranges);
++    seq_printf(m, "accessed=%lu (rich_metadata=%lu bitmap_only=%lu)\n",
++               n_bitmap, n_rich, n_bitmap - n_rich);
++
++    if (atomic_read(&g_track_window_active)) {
++        u64 now_ns = tracker_ktime_ns();
++        u64 remaining_ms = (now_ns < g_track_window_end_ns)
++                           ? (g_track_window_end_ns - now_ns) / 1000000ULL
++                           : 0;
++        seq_printf(m, "track_window_active=1 track_window_remaining_ms=%llu\n", remaining_ms);
++    } else {
++        seq_puts(m, "track_window_active=0\n");
++    }
++
++    seq_puts(m, "---\n");
++
++    list_for_each_entry(va_space, &g_uvm_global.va_spaces.list, list_node) {
++        uvm_va_range_t *va_range;
++        uvm_va_space_tracker_t *space_tracker = va_space->sampling_tracker;
++
++        if (!space_tracker)
++            continue;
++
++        seq_printf(m,
++                   "va_space=%px pid=%d epoch=%u active=%d sample_rate=%u gpu_id=%u\n",
++                   va_space,
++                   space_tracker->pid,
++                   READ_ONCE(space_tracker->epoch),
++                   READ_ONCE(space_tracker->active),
++                   READ_ONCE(space_tracker->sample_rate),
++                   READ_ONCE(space_tracker->gpu_id_val));
++
++        uvm_va_space_down_read(va_space);
++
++        uvm_for_each_va_range(va_range, va_space) {
++            uvm_va_range_tracker_t *range_tracker = va_range->sampling_tracker;
++            unsigned long page_index;
++            u32 cur_epoch;
++
++            if (!range_tracker)
++                continue;
++
++            cur_epoch = READ_ONCE(space_tracker->epoch);
++
++            seq_printf(m,
++                       "range=[0x%llx,0x%llx] pages=%lu record_pages=%lu stride=%lu\n",
++                       va_range->node.start,
++                       va_range->node.end,
++                       range_tracker->nr_pages,
++                       range_tracker->nr_record_pages,
++                       range_tracker->stride);
++
++            for_each_set_bit(page_index, range_tracker->bitmap, range_tracker->nr_pages) {
++                uvm_page_record_t *rec;
++                unsigned long long addr;
++
++                rec = &range_tracker->records[uvm_sampling_tracker_record_index(range_tracker, page_index)];
++                addr = va_range->node.start + ((unsigned long long)page_index << PAGE_SHIFT);
++
++                if (READ_ONCE(rec->epoch) == cur_epoch) {
++                    seq_printf(m,
++                               "  page=%-8lu addr=0x%llx pid=%-6u ts_ns=%-20llu access=",
++                               page_index,
++                               addr,
++                               READ_ONCE(rec->pid),
++                               READ_ONCE(rec->timestamp_ns));
++                    tracker_show_access_mask(m, READ_ONCE(rec->access_type_mask));
++                    seq_putc(m, '\n');
++                }
++                else {
++                    seq_printf(m, "  page=%-8lu addr=0x%llx\n", page_index, addr);
++                }
++            }
++        }
++
++        uvm_va_space_up_read(va_space);
++    }
++
++    uvm_mutex_unlock(&g_uvm_global.va_spaces.lock);
++    mutex_unlock(&tracker_lock);
++    return 0;
++}
++
++static int tracker_open(struct inode *inode, struct file *file)
++{
++    return single_open(file, tracker_show, NULL);
++}
++
++/* =========================
++   WRITE
++   ========================= */
++
++static ssize_t tracker_write(struct file *file,
++                             const char __user *buf,
++                             size_t count,
++                             loff_t *ppos)
++{
++    char kbuf[64];
++    uvm_va_space_t *va_space;
++    ssize_t ret = count;
++
++    if (count >= sizeof(kbuf))
++        return -EINVAL;
++    if (copy_from_user(kbuf, buf, count))
++        return -EFAULT;
++
++    kbuf[count] = '\0';
++
++    /* Strip trailing newline/whitespace so both echo and printf work. */
++    while (count > 0 && (kbuf[count - 1] == '\n' || kbuf[count - 1] == '\r' ||
++                          kbuf[count - 1] == ' '))
++        kbuf[--count] = '\0';
++
++    mutex_lock(&tracker_lock);
++
++    /* sample_rate <N> — 1=all blocks, N=1-in-N, 0=disable */
++    if (strncmp(kbuf, "sample_rate ", 12) == 0) {
++        unsigned int uval;
++
++        if (kstrtouint(kbuf + 12, 10, &uval) != 0) {
++            ret = -EINVAL;
++            goto out;
++        }
++        uvm_sampling_tracker_set_default_sample_rate(uval);
++
++        uvm_mutex_lock(&g_uvm_global.va_spaces.lock);
++        list_for_each_entry(va_space, &g_uvm_global.va_spaces.list, list_node) {
++            if (va_space->sampling_tracker)
++                WRITE_ONCE(va_space->sampling_tracker->sample_rate, uval);
++        }
++        uvm_mutex_unlock(&g_uvm_global.va_spaces.lock);
++
++        pr_info("[tracker] sample_rate=%u\n", uval);
++    }
++    /* enable <0|1> */
++    else if (strncmp(kbuf, "enable ", 7) == 0) {
++        int val;
++
++        if (kstrtoint(kbuf + 7, 10, &val) != 0) {
++            ret = -EINVAL;
++            goto out;
++        }
++        uvm_sampling_tracker_set_default_active(!!val);
++
++        uvm_mutex_lock(&g_uvm_global.va_spaces.lock);
++        list_for_each_entry(va_space, &g_uvm_global.va_spaces.list, list_node) {
++            if (va_space->sampling_tracker)
++                WRITE_ONCE(va_space->sampling_tracker->active, !!val);
++        }
++        uvm_mutex_unlock(&g_uvm_global.va_spaces.lock);
++
++        pr_info("[tracker] active=%d\n", !!val);
++    }
++    /*
++     * clear — reset bitmaps and bump epoch without revoking GPU PTEs.
++     *
++     * Bitmaps are zeroed BEFORE the epoch is bumped. If the epoch were bumped
++     * first, a concurrent fault handler could set a bitmap bit for the new
++     * epoch and bitmap_zero would then clear it — leaving a valid new-epoch
++     * record invisible to for_each_set_bit in the read path.
++     */
++    else if (strcmp(kbuf, "clear") == 0) {
++        uvm_mutex_lock(&g_uvm_global.va_spaces.lock);
++        list_for_each_entry(va_space, &g_uvm_global.va_spaces.list, list_node) {
++            uvm_va_range_t *va_range;
++            uvm_va_space_tracker_t *space_tracker = va_space->sampling_tracker;
++            u32 next_epoch;
++
++            if (!space_tracker)
++                continue;
++
++            uvm_va_space_down_read(va_space);
++            uvm_for_each_va_range(va_range, va_space)
++                tracker_clear_range(va_range->sampling_tracker);
++            uvm_va_space_up_read(va_space);
++
++            next_epoch = READ_ONCE(space_tracker->epoch) + 1;
++            if (next_epoch == 0)
++                next_epoch = 1;
++            WRITE_ONCE(space_tracker->epoch, next_epoch);
++        }
++        uvm_mutex_unlock(&g_uvm_global.va_spaces.lock);
++
++        pr_info("[tracker] cleared all tracked ranges\n");
++    }
++    /*
++     * revoke <pid>  — start a new epoch and unmap GPU pages for one process
++     *                 (matched by the tgid stored in space_tracker->pid).
++     * revoke all    — same but across every tracked VA space.
++     *
++     * Order: zero bitmaps first, then bump epoch, then unmap GPU PTEs.
++     * Same reasoning as "clear": bumping before zeroing risks a concurrent
++     * fault writing a new-epoch record whose bitmap bit is then cleared.
++     */
++    else if (strncmp(kbuf, "revoke ", 7) == 0) {
++        const char *arg = kbuf + 7;
++        bool do_all = (strcmp(arg, "all") == 0);
++        pid_t target_pid = 0;
++
++        if (!do_all) {
++            if (kstrtoint(arg, 10, &target_pid) != 0 || target_pid <= 0) {
++                ret = -EINVAL;
++                goto out;
++            }
++        }
++
++        uvm_mutex_lock(&g_uvm_global.va_spaces.lock);
++        list_for_each_entry(va_space, &g_uvm_global.va_spaces.list, list_node) {
++            uvm_va_range_t *va_range;
++            uvm_va_space_tracker_t *space_tracker = va_space->sampling_tracker;
++            NV_STATUS status;
++            uvm_gpu_id_t gpu_id;
++            u32 next_epoch;
++
++            if (!space_tracker)
++                continue;
++            if (!do_all && (pid_t)space_tracker->pid != target_pid)
++                continue;
++
++            uvm_va_space_down_read(va_space);
++            uvm_for_each_va_range(va_range, va_space)
++                tracker_clear_range(va_range->sampling_tracker);
++            uvm_va_space_up_read(va_space);
++
++            next_epoch = READ_ONCE(space_tracker->epoch) + 1;
++            if (next_epoch == 0)
++                next_epoch = 1;
++            WRITE_ONCE(space_tracker->epoch, next_epoch);
++
++            if (READ_ONCE(space_tracker->gpu_id_val) == UVM_ID_INVALID.val)
++                continue;
++
++            gpu_id = uvm_gpu_id_from_value(READ_ONCE(space_tracker->gpu_id_val));
++            status = uvm_tracking_revoke_epoch(va_space, gpu_id);
++            if (status != NV_OK)
++                pr_err("[tracker] revoke epoch failed for %px: 0x%x\n", va_space, status);
++        }
++        uvm_mutex_unlock(&g_uvm_global.va_spaces.lock);
++
++        if (do_all)
++            pr_info("[tracker] revoke all completed\n");
++        else
++            pr_info("[tracker] revoke pid=%d completed\n", target_pid);
++    }
++    /*
++     * track_window <ms> — revoke all GPU mappings, enable tracking, and
++     *                     automatically stop after <ms> milliseconds.
++     *
++     * Any in-progress window is cancelled and replaced. The revoke ensures
++     * every subsequent GPU access faults and is recorded fresh; without it,
++     * already-mapped pages would never re-fault and would be invisible to
++     * the tracker.
++     *
++     * Range: 1–300000 ms (up to 5 minutes).
++     */
++    else if (strncmp(kbuf, "track_window ", 13) == 0) {
++        unsigned int ms;
++        NV_STATUS status;
++        uvm_gpu_id_t gpu_id;
++
++        if (kstrtouint(kbuf + 13, 10, &ms) != 0 || ms == 0 || ms > 300000) {
++            ret = -EINVAL;
++            goto out;
++        }
++
++        /* Cancel any in-progress window (non-blocking; stop_fn holds no locks). */
++        cancel_delayed_work(&g_track_stop_work);
++        atomic_set(&g_track_window_active, 0);
++
++        uvm_mutex_lock(&g_uvm_global.va_spaces.lock);
++        list_for_each_entry(va_space, &g_uvm_global.va_spaces.list, list_node) {
++            uvm_va_range_t *va_range;
++            uvm_va_space_tracker_t *space_tracker = va_space->sampling_tracker;
++            u32 next_epoch;
++
++            if (!space_tracker)
++                continue;
++
++            /* Zero bitmaps before bumping epoch (same race reasoning as clear). */
++            uvm_va_space_down_read(va_space);
++            uvm_for_each_va_range(va_range, va_space)
++                tracker_clear_range(va_range->sampling_tracker);
++            uvm_va_space_up_read(va_space);
++
++            next_epoch = READ_ONCE(space_tracker->epoch) + 1;
++            if (next_epoch == 0)
++                next_epoch = 1;
++            WRITE_ONCE(space_tracker->epoch, next_epoch);
++            WRITE_ONCE(space_tracker->active, 1);
++
++            if (READ_ONCE(space_tracker->gpu_id_val) == UVM_ID_INVALID.val)
++                continue;
++
++            gpu_id = uvm_gpu_id_from_value(READ_ONCE(space_tracker->gpu_id_val));
++            status = uvm_tracking_revoke_epoch(va_space, gpu_id);
++            if (status != NV_OK)
++                pr_err("[tracker] track_window revoke failed for %px: 0x%x\n", va_space, status);
++        }
++        uvm_mutex_unlock(&g_uvm_global.va_spaces.lock);
++
++        uvm_sampling_tracker_set_default_active(1);
++        g_track_window_end_ns = tracker_ktime_ns() + (u64)ms * 1000000ULL;
++        atomic_set(&g_track_window_active, 1);
++        schedule_delayed_work(&g_track_stop_work, msecs_to_jiffies(ms));
++
++        pr_info("[tracker] track_window=%ums started\n", ms);
++    }
++    /* track_stop — cancel any active window and stop tracking immediately. */
++    else if (strcmp(kbuf, "track_stop") == 0) {
++        cancel_delayed_work(&g_track_stop_work);
++        atomic_set(&g_track_window_active, 0);
++        uvm_sampling_tracker_set_default_active(0);
++
++        uvm_mutex_lock(&g_uvm_global.va_spaces.lock);
++        list_for_each_entry(va_space, &g_uvm_global.va_spaces.list, list_node) {
++            if (va_space->sampling_tracker)
++                WRITE_ONCE(va_space->sampling_tracker->active, 0);
++        }
++        uvm_mutex_unlock(&g_uvm_global.va_spaces.lock);
++
++        pr_info("[tracker] track_window stopped manually\n");
++    }
++    else {
++        ret = -EINVAL;
++    }
++
++out:
++    mutex_unlock(&tracker_lock);
++    return ret;
++}
++
++/* =========================
++   PROC OPS
++   ========================= */
++
++static const struct proc_ops tracker_ops = {
++    .proc_open    = tracker_open,
++    .proc_read    = seq_read,
++    .proc_lseek   = seq_lseek,
++    .proc_release = single_release,
++    .proc_write   = tracker_write,
++};
++
++/* =========================
++   INIT / DESTROY
++   ========================= */
++
++int uvm_sampling_procfs_init(void)
++{
++    INIT_DELAYED_WORK(&g_track_stop_work, track_stop_fn);
++
++    tracker_proc = proc_create(PROC_NAME, 0666, NULL, &tracker_ops);
++    if (!tracker_proc)
++        return -ENOMEM;
++    pr_info("[tracker] /proc/%s created\n", PROC_NAME);
++    return 0;
++}
++
++void uvm_sampling_procfs_destroy(void)
++{
++    cancel_delayed_work_sync(&g_track_stop_work);
++    if (tracker_proc)
++        proc_remove(tracker_proc);
++}
+diff --git a/nvidia-uvm/uvm_sampling_tracker.c b/nvidia-uvm/uvm_sampling_tracker.c
+new file mode 100644
+index 0000000..608db0f
+--- /dev/null
++++ b/nvidia-uvm/uvm_sampling_tracker.c
+@@ -0,0 +1,235 @@
++#include <linux/module.h>
++#include <linux/ktime.h>
++#include <linux/timekeeping.h>
++#include <linux/sched.h>
++
++#include "uvm_sampling_tracker.h"
++#include "uvm_kvmalloc.h"
++#include "uvm_va_range.h"
++#include "uvm_va_space.h"
++
++/* ktime_get_ns() calls ktime_get() which is EXPORT_SYMBOL_GPL; use the
++ * non-GPL ktime_get_raw_ts64 path so proprietary modules can load. */
++static inline u64 uvm_ktime_get_ns(void)
++{
++    struct timespec64 ts;
++    ktime_get_raw_ts64(&ts);
++    return timespec64_to_ns(&ts);
++}
++
++typedef struct
++{
++    int active;
++    u32 sample_rate;
++} uvm_sampling_tracker_defaults_t;
++
++static uvm_sampling_tracker_defaults_t g_sampling_tracker_defaults = {
++    .active = 1,
++    .sample_rate = 1,
++};
++
++static void uvm_sampling_tracker_update_access_mask(uvm_page_record_t *rec, u32 access_type_mask)
++{
++    u32 old_mask;
++    u32 new_mask;
++
++    if (!access_type_mask)
++        return;
++
++    do {
++        old_mask = READ_ONCE(rec->access_type_mask);
++        new_mask = old_mask | access_type_mask;
++        if (new_mask == old_mask)
++            return;
++    } while (cmpxchg(&rec->access_type_mask, old_mask, new_mask) != old_mask);
++}
++
++static void uvm_sampling_tracker_free_range_tracker(uvm_va_range_tracker_t *range_tracker)
++{
++    if (!range_tracker)
++        return;
++
++    uvm_kvfree(range_tracker->records);
++    uvm_kvfree(range_tracker->bitmap);
++    uvm_kvfree(range_tracker);
++}
++
++static uvm_va_range_tracker_t *uvm_sampling_tracker_alloc_range_tracker(uvm_va_range_t *va_range)
++{
++    uvm_va_range_tracker_t *range_tracker;
++    unsigned long nr_pages = uvm_va_range_size(va_range) >> PAGE_SHIFT;
++    unsigned long nr_record_pages = min(nr_pages, (unsigned long)UVM_TRACKER_RECORD_PAGES);
++    size_t bitmap_bytes;
++    size_t record_bytes;
++
++    if (nr_pages == 0)
++        return NULL;
++
++    range_tracker = uvm_kvmalloc_zero(sizeof(*range_tracker));
++    if (!range_tracker)
++        return NULL;
++
++    bitmap_bytes = BITS_TO_LONGS(nr_pages) * sizeof(range_tracker->bitmap[0]);
++    record_bytes = nr_record_pages * sizeof(range_tracker->records[0]);
++
++    range_tracker->bitmap = uvm_kvmalloc_zero(bitmap_bytes);
++    if (!range_tracker->bitmap)
++        goto error;
++
++    range_tracker->records = uvm_kvmalloc_zero(record_bytes);
++    if (!range_tracker->records)
++        goto error;
++
++    range_tracker->va_range = va_range;
++    range_tracker->nr_pages = nr_pages;
++    range_tracker->nr_record_pages = nr_record_pages;
++    range_tracker->stride = DIV_ROUND_UP(nr_pages, nr_record_pages);
++    if (range_tracker->stride == 0)
++        range_tracker->stride = 1;
++
++    return range_tracker;
++
++error:
++    uvm_sampling_tracker_free_range_tracker(range_tracker);
++    return NULL;
++}
++
++int uvm_sampling_tracker_default_active(void)
++{
++    return READ_ONCE(g_sampling_tracker_defaults.active);
++}
++
++u32 uvm_sampling_tracker_default_sample_rate(void)
++{
++    return READ_ONCE(g_sampling_tracker_defaults.sample_rate);
++}
++
++void uvm_sampling_tracker_set_default_active(int active)
++{
++    WRITE_ONCE(g_sampling_tracker_defaults.active, !!active);
++}
++
++void uvm_sampling_tracker_set_default_sample_rate(u32 sample_rate)
++{
++    WRITE_ONCE(g_sampling_tracker_defaults.sample_rate, sample_rate);
++}
++
++void uvm_sampling_tracker_init_va_space(uvm_va_space_t *va_space)
++{
++    uvm_va_space_tracker_t *space_tracker;
++
++    if (!va_space || va_space->sampling_tracker)
++        return;
++
++    space_tracker = uvm_kvmalloc_zero(sizeof(*space_tracker));
++    if (!space_tracker) {
++        pr_err("[tracker] failed to allocate VA space tracker for %px\n", va_space);
++        return;
++    }
++
++    space_tracker->va_space = va_space;
++    space_tracker->epoch = 1;
++    space_tracker->pid = task_tgid_nr(current);
++    space_tracker->active = uvm_sampling_tracker_default_active();
++    space_tracker->sample_rate = uvm_sampling_tracker_default_sample_rate();
++    space_tracker->gpu_id_val = UVM_ID_INVALID.val;
++
++    va_space->sampling_tracker = space_tracker;
++}
++
++void uvm_sampling_tracker_destroy_va_space(uvm_va_space_t *va_space)
++{
++    if (!va_space)
++        return;
++
++    uvm_kvfree(va_space->sampling_tracker);
++    va_space->sampling_tracker = NULL;
++}
++
++void uvm_sampling_tracker_init_va_range(uvm_va_range_t *va_range)
++{
++    if (!va_range || va_range->sampling_tracker || va_range->type != UVM_VA_RANGE_TYPE_MANAGED)
++        return;
++
++    va_range->sampling_tracker = uvm_sampling_tracker_alloc_range_tracker(va_range);
++    if (!va_range->sampling_tracker) {
++        pr_err("[tracker] failed to allocate range tracker for [0x%llx, 0x%llx]\n",
++               va_range->node.start,
++               va_range->node.end);
++    }
++}
++
++void uvm_sampling_tracker_destroy_va_range(uvm_va_range_t *va_range)
++{
++    if (!va_range)
++        return;
++
++    uvm_sampling_tracker_free_range_tracker(va_range->sampling_tracker);
++    va_range->sampling_tracker = NULL;
++}
++
++void uvm_sampling_tracker_reset_va_range(uvm_va_range_t *va_range)
++{
++    uvm_sampling_tracker_destroy_va_range(va_range);
++    uvm_sampling_tracker_init_va_range(va_range);
++}
++
++void uvm_sampling_tracker_record(uvm_va_space_tracker_t *space_tracker,
++                                 uvm_va_range_tracker_t *range_tracker,
++                                 unsigned long addr,
++                                 unsigned long base_va,
++                                 u8 access_type)
++{
++    unsigned long page_index;
++    unsigned long record_index;
++    uvm_page_record_t *rec;
++    u32 cur_epoch;
++    u32 old_epoch;
++    u32 access_type_mask;
++
++    if (!space_tracker || !range_tracker || !READ_ONCE(space_tracker->active))
++        return;
++    if (addr < base_va)
++        return;
++
++    page_index = (addr - base_va) >> PAGE_SHIFT;
++    if (page_index >= range_tracker->nr_pages)
++        return;
++
++    set_bit(page_index, range_tracker->bitmap);
++
++    record_index = uvm_sampling_tracker_record_index(range_tracker, page_index);
++    rec = &range_tracker->records[record_index];
++    cur_epoch = READ_ONCE(space_tracker->epoch);
++    old_epoch = READ_ONCE(rec->epoch);
++    access_type_mask = uvm_sampling_tracker_access_type_mask(access_type);
++
++    if (old_epoch == cur_epoch) {
++        uvm_sampling_tracker_update_access_mask(rec, access_type_mask);
++        return;
++    }
++
++    if (cmpxchg(&rec->epoch, old_epoch, cur_epoch) != old_epoch) {
++        if (READ_ONCE(rec->epoch) == cur_epoch)
++            uvm_sampling_tracker_update_access_mask(rec, access_type_mask);
++        return;
++    }
++
++    WRITE_ONCE(rec->timestamp_ns, uvm_ktime_get_ns());
++    WRITE_ONCE(rec->pid, (u32)task_tgid_nr(current));
++    WRITE_ONCE(rec->access_type_mask, access_type_mask);
++}
++
++void uvm_sampling_tracker_init(void)
++{
++    uvm_sampling_tracker_set_default_active(1);
++    uvm_sampling_tracker_set_default_sample_rate(1);
++
++    if (uvm_sampling_procfs_init() != 0)
++        pr_err("[tracker] failed to create procfs entry\n");
++}
++
++void uvm_sampling_tracker_destroy(void)
++{
++    uvm_sampling_procfs_destroy();
++}
+diff --git a/nvidia-uvm/uvm_sampling_tracker.h b/nvidia-uvm/uvm_sampling_tracker.h
+new file mode 100644
+index 0000000..9d9f939
+--- /dev/null
++++ b/nvidia-uvm/uvm_sampling_tracker.h
+@@ -0,0 +1,122 @@
++#ifndef UVM_SAMPLING_TRACKER_H
++#define UVM_SAMPLING_TRACKER_H
++
++#include "uvm_forward_decl.h"
++
++#include <linux/bitmap.h>
++#include <linux/types.h>
++
++#define UVM_TRACKER_RECORD_PAGES  (1UL << 17)  /* 128K sampled metadata slots */
++
++/*
++ * Per-record first-access metadata.
++ *
++ * Each record represents one stride-sampled region within a VA range. The
++ * record stores the first access metadata seen in the current epoch and a
++ * bitmask of all access types observed for that region.
++ */
++typedef struct {
++    u64 timestamp_ns;      /* ktime_get_ns() of first access this epoch */
++    u32 pid;               /* tgid of the first faulting process         */
++    u32 epoch;             /* epoch counter when this record was written */
++    u32 access_type_mask;  /* bitmask of UVM_FAULT_ACCESS_TYPE_* bits    */
++} uvm_page_record_t;
++
++struct uvm_va_space_tracker_struct
++{
++    uvm_va_space_t *va_space;
++    u32 epoch;
++    pid_t pid;
++    int active;
++    u32 sample_rate;
++    u32 gpu_id_val;
++};
++
++struct uvm_va_range_tracker_struct
++{
++    uvm_va_range_t     *va_range;
++    unsigned long      *bitmap;
++    unsigned long       nr_pages;
++    uvm_page_record_t  *records;
++    unsigned long       nr_record_pages;
++    unsigned long       stride;
++};
++
++static inline u32 uvm_sampling_tracker_access_type_mask(u8 access_type)
++{
++    if (access_type >= 32)
++        return 0;
++
++    return 1U << access_type;
++}
++
++static inline unsigned long uvm_sampling_tracker_record_index(const uvm_va_range_tracker_t *range_tracker,
++                                                              unsigned long page_index)
++{
++    unsigned long record_index;
++
++    if (!range_tracker || range_tracker->nr_record_pages == 0)
++        return 0;
++
++    record_index = page_index / range_tracker->stride;
++    if (record_index >= range_tracker->nr_record_pages)
++        record_index = range_tracker->nr_record_pages - 1;
++
++    return record_index;
++}
++
++/*
++ * Returns true if the VA block whose allocation starts at block_start should
++ * have prefetch suppressed and its faults recorded. Safe to call from any
++ * context; reads the per-VA-space state locklessly.
++ *
++ * UVM_VA_BLOCK_BITS (21) is used directly to avoid a circular header
++ * dependency on uvm_va_block_types.h.
++ */
++static inline bool uvm_sampling_tracker_block_sampled(uvm_va_space_tracker_t *space_tracker,
++                                                      uvm_va_range_tracker_t *range_tracker,
++                                                      unsigned long block_start)
++{
++    u32 rate;
++
++    if (!space_tracker || !range_tracker || !READ_ONCE(space_tracker->active))
++        return false;
++
++    rate = READ_ONCE(space_tracker->sample_rate);
++    if (rate == 0)
++        return false;
++    if (rate == 1)
++        return true;
++
++    return ((block_start >> 21) % rate) == 0;
++}
++
++static inline void uvm_sampling_tracker_set_context(uvm_va_space_tracker_t *space_tracker, u32 gpu_id_val)
++{
++    if (space_tracker)
++        WRITE_ONCE(space_tracker->gpu_id_val, gpu_id_val);
++}
++
++int uvm_sampling_tracker_default_active(void);
++u32 uvm_sampling_tracker_default_sample_rate(void);
++void uvm_sampling_tracker_set_default_active(int active);
++void uvm_sampling_tracker_set_default_sample_rate(u32 sample_rate);
++
++void uvm_sampling_tracker_init_va_space(uvm_va_space_t *va_space);
++void uvm_sampling_tracker_destroy_va_space(uvm_va_space_t *va_space);
++void uvm_sampling_tracker_init_va_range(uvm_va_range_t *va_range);
++void uvm_sampling_tracker_destroy_va_range(uvm_va_range_t *va_range);
++void uvm_sampling_tracker_reset_va_range(uvm_va_range_t *va_range);
++
++void uvm_sampling_tracker_record(uvm_va_space_tracker_t *space_tracker,
++                                 uvm_va_range_tracker_t *range_tracker,
++                                 unsigned long addr,
++                                 unsigned long base_va,
++                                 u8 access_type);
++
++void uvm_sampling_tracker_init(void);
++void uvm_sampling_tracker_destroy(void);
++int  uvm_sampling_procfs_init(void);
++void uvm_sampling_procfs_destroy(void);
++
++#endif /* UVM_SAMPLING_TRACKER_H */
+diff --git a/nvidia-uvm/uvm_va_block.c b/nvidia-uvm/uvm_va_block.c
+index e6deb17..e4fbc72 100644
+--- a/nvidia-uvm/uvm_va_block.c
++++ b/nvidia-uvm/uvm_va_block.c
+@@ -20,6 +20,7 @@
+     DEALINGS IN THE SOFTWARE.
+ 
+ *******************************************************************************/
++#include "uvm_sampling_tracker.h"
+ 
+ #include "uvm_linux.h"
+ #include "uvm_common.h"
+@@ -9484,8 +9485,17 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
+ 
+         prefetch_hint = uvm_perf_prefetch_get_hint(va_block, new_residency_mask);
+ 
+-        // Obtain the prefetch hint and give a fake fault access type to the
+-        // prefetched pages
++        // For sampled blocks, suppress all prefetch effects.  The hint is
++        // consumed in two places below: (1) the region/access_type expansion
++        // here and (2) the new_residency_mask OR in the per-processor migration
++        // loop.  Both must be suppressed so that prefetch pages are never
++        // silently migrated or mapped — every page must fault individually for
++        // page-level tracking granularity.
++        if (uvm_sampling_tracker_block_sampled(va_block->va_range->va_space->sampling_tracker,
++                                               va_block->va_range->sampling_tracker,
++                                               va_block->start))
++            prefetch_hint = UVM_PERF_PREFETCH_HINT_NONE();
++
+         if (UVM_ID_IS_VALID(prefetch_hint.residency)) {
+             UVM_ASSERT(prefetch_hint.prefetch_pages_mask != NULL);
+ 
+@@ -10958,3 +10968,75 @@ void uvm_va_block_mark_cpu_dirty(uvm_va_block_t *va_block)
+     block_mark_region_cpu_dirty(va_block, uvm_va_block_region_from_block(va_block));
+ }
+ 
++// Fully unmap all GPU-accessible pages in a single VA block so that any
++// subsequent GPU access (read or write) triggers a replayable fault.
++// The fault handler reinstalls the PTE pointing to the same physical GPU
++// memory — data does not move.
++//
++// Skips blocks with no GPU read mapping (already unmapped, nothing to do).
++// Caller must hold va_block->lock.
++NV_STATUS uvm_va_block_unmap_for_tracking(uvm_va_block_t *va_block,
++                                           uvm_va_block_context_t *block_context,
++                                           uvm_gpu_id_t gpu_id)
++{
++    uvm_va_block_gpu_state_t *gpu_state;
++    uvm_va_block_region_t region;
++
++    uvm_assert_mutex_locked(&va_block->lock);
++
++    if (!uvm_processor_mask_test(&va_block->mapped, gpu_id))
++        return NV_OK;
++
++    gpu_state = block_gpu_state_get(va_block, gpu_id);
++    if (!gpu_state)
++        return NV_OK;
++
++    // Skip if already fully unmapped (read bit clear means no mapping at all)
++    if (uvm_page_mask_empty(&gpu_state->pte_bits[UVM_PTE_BITS_GPU_READ]))
++        return NV_OK;
++
++    region = uvm_va_block_region_from_block(va_block);
++
++    return uvm_va_block_unmap(va_block,
++                              block_context,
++                              gpu_id,
++                              region,
++                              NULL,
++                              &va_block->tracker);
++}
++
++// Walk every managed VA block in the VA space and fully unmap GPU pages,
++// starting a new tracking epoch. Every subsequent GPU access (read or write)
++// will fault, get recorded by the tracker, and have mappings restored by the
++// fault handler.
++NV_STATUS uvm_tracking_revoke_epoch(uvm_va_space_t *va_space, uvm_gpu_id_t gpu_id)
++{
++    uvm_va_range_t *va_range;
++    uvm_va_block_t *va_block;
++    uvm_va_block_context_t *block_context;
++    NV_STATUS status = NV_OK;
++
++    block_context = uvm_va_block_context_alloc(NULL);
++    if (!block_context)
++        return NV_ERR_NO_MEMORY;
++
++    uvm_va_space_down_read(va_space);
++
++    uvm_for_each_va_range(va_range, va_space) {
++        if (va_range->type != UVM_VA_RANGE_TYPE_MANAGED)
++            continue;
++
++        for_each_va_block_in_va_range(va_range, va_block) {
++            uvm_mutex_lock(&va_block->lock);
++            status = uvm_va_block_unmap_for_tracking(va_block, block_context, gpu_id);
++            uvm_mutex_unlock(&va_block->lock);
++            if (status != NV_OK)
++                goto out;
++        }
++    }
++
++out:
++    uvm_va_space_up_read(va_space);
++    uvm_va_block_context_free(block_context);
++    return status;
++}
+diff --git a/nvidia-uvm/uvm_va_block.h b/nvidia-uvm/uvm_va_block.h
+index 33b2593..f70c1d1 100644
+--- a/nvidia-uvm/uvm_va_block.h
++++ b/nvidia-uvm/uvm_va_block.h
+@@ -867,6 +867,16 @@ NV_STATUS uvm_va_block_revoke_prot_mask(uvm_va_block_t *va_block,
+                                         const uvm_page_mask_t *revoke_page_mask,
+                                         uvm_prot_t prot_to_revoke);
+ 
++// Access tracker: fully unmap all GPU-accessible pages in a block so that
++// any access (read or write) faults and gets recorded. Caller must hold va_block->lock.
++NV_STATUS uvm_va_block_unmap_for_tracking(uvm_va_block_t *va_block,
++                                           uvm_va_block_context_t *block_context,
++                                           uvm_gpu_id_t gpu_id);
++
++// Sweep all managed VA blocks in va_space and unmap GPU pages,
++// starting a new tracking epoch.
++NV_STATUS uvm_tracking_revoke_epoch(uvm_va_space_t *va_space, uvm_gpu_id_t gpu_id);
++
+ // Tries to map all pages in the given region and map_page_mask with at most
+ // max_prot privileges for appropriate processors as determined by the
+ // accessed_by mask, heuristics and the given processor mask (excluding
+diff --git a/nvidia-uvm/uvm_va_range.c b/nvidia-uvm/uvm_va_range.c
+index 69149e5..215c988 100644
+--- a/nvidia-uvm/uvm_va_range.c
++++ b/nvidia-uvm/uvm_va_range.c
+@@ -30,6 +30,7 @@
+ #include "uvm_kvmalloc.h"
+ #include "uvm_map_external.h"
+ #include "uvm_perf_thrashing.h"
++#include "uvm_sampling_tracker.h"
+ #include "nv_uvm_interface.h"
+ 
+ static struct kmem_cache *g_uvm_va_range_cache __read_mostly;
+@@ -146,6 +147,8 @@ static uvm_va_range_t *uvm_va_range_alloc_managed(uvm_va_space_t *va_space, NvU6
+         goto error;
+     }
+ 
++    uvm_sampling_tracker_init_va_range(va_range);
++
+     return va_range;
+ 
+ error:
+@@ -484,6 +487,7 @@ void uvm_va_range_destroy(uvm_va_range_t *va_range, struct list_head *deferred_f
+                            va_range->node.start, va_range->node.end, va_range->type);
+     }
+ 
++    uvm_sampling_tracker_destroy_va_range(va_range);
+     kmem_cache_free(g_uvm_va_range_cache, va_range);
+ }
+ 
+@@ -1060,6 +1064,7 @@ NV_STATUS uvm_va_range_split(uvm_va_range_t *existing_va_range,
+ 
+     // Finally, update the VA range tree
+     uvm_range_tree_split(&va_space->va_range_tree, &existing_va_range->node, &new->node);
++    uvm_sampling_tracker_reset_va_range(existing_va_range);
+ 
+     if (new->type == UVM_VA_RANGE_TYPE_MANAGED) {
+         event_data.range_shrink.range = new;
+diff --git a/nvidia-uvm/uvm_va_range.h b/nvidia-uvm/uvm_va_range.h
+index 6afc8ce..ed8312f 100644
+--- a/nvidia-uvm/uvm_va_range.h
++++ b/nvidia-uvm/uvm_va_range.h
+@@ -387,6 +387,9 @@ struct uvm_va_range_struct
+     //       them all at range allocation.
+     atomic_long_t *blocks;
+ 
++    // Optional per-range sampling state. Only managed ranges allocate it.
++    uvm_va_range_tracker_t *sampling_tracker;
++
+     uvm_va_range_type_t type;
+     union
+     {
+diff --git a/nvidia-uvm/uvm_va_space.c b/nvidia-uvm/uvm_va_space.c
+index b882ae6..7a20f15 100644
+--- a/nvidia-uvm/uvm_va_space.c
++++ b/nvidia-uvm/uvm_va_space.c
+@@ -40,6 +40,7 @@
+ #include "uvm_common.h"
+ #include "nv_uvm_interface.h"
+ #include "nv-kthread-q.h"
++#include "uvm_sampling_tracker.h"
+ 
+ static bool processor_mask_array_test(const uvm_processor_mask_t *mask,
+                                       uvm_processor_id_t mask_id,
+@@ -188,6 +189,7 @@ NV_STATUS uvm_va_space_create(struct inode *inode, struct file *filp)
+     filp->f_mapping = &va_space->mapping;
+ 
+     va_space->test.page_prefetch_enabled = true;
++    uvm_sampling_tracker_init_va_space(va_space);
+ 
+     init_tools_data(va_space);
+ 
+@@ -218,6 +220,7 @@ fail:
+     uvm_perf_destroy_va_space_events(&va_space->perf_events);
+     uvm_va_space_up_write(va_space);
+ 
++    uvm_sampling_tracker_destroy_va_space(va_space);
+     uvm_kvfree(va_space);
+ 
+     return status;
+@@ -509,6 +512,7 @@ void uvm_va_space_destroy(uvm_va_space_t *va_space)
+ 
+     uvm_mutex_unlock(&g_uvm_global.global_lock);
+ 
++    uvm_sampling_tracker_destroy_va_space(va_space);
+     uvm_kvfree(va_space);
+ }
+ 
+diff --git a/nvidia-uvm/uvm_va_space.h b/nvidia-uvm/uvm_va_space.h
+index 9e97154..567b032 100644
+--- a/nvidia-uvm/uvm_va_space.h
++++ b/nvidia-uvm/uvm_va_space.h
+@@ -201,6 +201,9 @@ struct uvm_va_space_struct
+     // Tree of uvm_va_range_t's
+     uvm_range_tree_t va_range_tree;
+ 
++    // Per-process sampling access tracker.
++    uvm_va_space_tracker_t *sampling_tracker;
++
+     // Kernel mapping structure passed to unmap_mapping range to unmap CPU PTEs
+     // in this process.
+     struct address_space mapping;
+-- 
+2.25.1
+
